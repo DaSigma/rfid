@@ -1,5 +1,5 @@
 /*
- * RC522 RFID Access Control System with WS2812 LED for Arduino Uno WiFi Rev 2
+ * RC522 RFID Access Control System with WS2812 LED and 12V Magnetic Lock for Arduino Uno WiFi Rev 2
  * Master Card: 93 52 EA 2F
  * 
  * Wiring connections:
@@ -22,6 +22,17 @@
  * Positive (+) --> Pin 7
  * Negative (-) --> GND
  * 
+ * Relay Module (for 12V Mag Lock):
+ * VCC  -->  5V
+ * GND  -->  GND
+ * IN   -->  Pin 5
+ * COM  -->  12V Power Supply Positive
+ * NO   -->  Magnetic Lock Positive
+ * 
+ * 12V Power Supply:
+ * Positive --> Relay COM terminal
+ * Negative --> Magnetic Lock Negative AND Arduino GND (common ground)
+ * 
  * ICSP Header pinout (2x3 header):
  * 1: MISO    2: VCC
  * 3: SCK     4: MOSI  
@@ -37,10 +48,12 @@
 #define SS_PIN          8          // Slave Select pin
 #define LED_PIN         6          // WS2812 LED strip data pin
 #define BUZZER_PIN      7          // Buzzer pin
+#define RELAY_PIN       5          // Relay control pin for mag lock
 #define NUM_LEDS        1          // Number of LEDs (change if using more)
 #define MAX_CARDS       20         // Maximum number of stored cards
 #define ACCESS_TIMEOUT  5000       // 5 seconds in milliseconds
 #define LED_TIMEOUT     3000       // 3 seconds to show status before returning to blue
+#define UNLOCK_DURATION 3000       // 3 seconds unlock time for authorized access - REMOVED AUTO-LOCK
 
 // EEPROM addresses
 #define EEPROM_CARD_COUNT_ADDR  0  // Address to store card count
@@ -48,10 +61,11 @@
 
 // LED Colors
 #define COLOR_OFF       0x000000   // Black (off)
-#define COLOR_RED       0xFF0000   // Red (access denied)
-#define COLOR_GREEN     0x00FF00   // Green (access granted)
+#define COLOR_RED       0xFF0000   // Red (access denied/locked)
+#define COLOR_GREEN     0x00FF00   // Green (access granted/unlocked)
 #define COLOR_ORANGE    0xFF8000   // Orange (waiting for access)
-#define COLOR_BLUE      0x0000FF   // Blue (system ready)
+#define COLOR_BLUE      0x0000FF   // Blue (system ready/locked)
+#define COLOR_PURPLE    0x800080   // Purple (lock control mode)
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);  // Create MFRC522 instance
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -65,9 +79,13 @@ int cardCount = 0;
 
 // Access control variables
 bool accessGranted = false;
-bool removalMode = false;  // New: removal mode for deleting cards
+bool removalMode = false;  // removal mode for deleting cards
 unsigned long accessStartTime = 0;
 bool waitingForMaster = false;
+
+// Magnetic lock control variables
+bool lockUnlocked = false;
+// Removed auto-lock timer - lock stays in chosen state until toggled
 
 // LED control variables
 unsigned long ledTimer = 0;
@@ -92,6 +110,10 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   
+  // Initialize relay pin (HIGH = lock engaged, LOW = lock released)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Start with lock engaged
+  
   // Load cards from EEPROM
   loadCardsFromEEPROM();
   
@@ -102,7 +124,7 @@ void setup() {
   systemStartupBeep();
   
   Serial.println(F("================================================="));
-  Serial.println(F("    RFID Access Control System Initialized"));
+  Serial.println(F("  RFID Access Control System with Mag Lock"));
   Serial.println(F("================================================="));
   Serial.print(F("Master Card: "));
   printHex(masterCard, 4);
@@ -110,11 +132,15 @@ void setup() {
   Serial.print(F("Loaded "));
   Serial.print(cardCount);
   Serial.println(F(" authorized cards from memory."));
-  Serial.println(F("System ready. Present a card to access."));
+  Serial.println(F("System ready. Magnetic lock ENGAGED."));
+  Serial.println(F("Present a card to access."));
+  Serial.println(F("Authorized cards toggle lock state permanently."));
   Serial.println(F("================================================="));
 }
 
 void loop() {
+  // Auto-lock timer removed - lock remains in state until toggled by authorized card
+  
   // Handle flashing LED in removal mode
   if (removalMode && (millis() - flashTimer > FLASH_INTERVAL)) {
     flashTimer = millis();
@@ -126,11 +152,15 @@ void loop() {
     }
   }
   
-  // Check if LED timer should return to blue (default state) - but not in removal mode
+  // Check if LED timer should return to appropriate state - but not in removal mode
   if (!removalMode && ledTimerActive && (millis() - ledTimer > LED_TIMEOUT)) {
     ledTimerActive = false;
-    setLEDColor(COLOR_BLUE);
-    currentLEDState = COLOR_BLUE;
+    if (lockUnlocked) {
+      setLEDColor(COLOR_GREEN);
+    } else {
+      setLEDColor(COLOR_BLUE);
+    }
+    currentLEDState = lockUnlocked ? COLOR_GREEN : COLOR_BLUE;
   }
   
   // Check if access timeout has expired
@@ -138,14 +168,20 @@ void loop() {
     accessGranted = false;
     removalMode = false;
     waitingForMaster = false;
-    setLEDColor(COLOR_BLUE); // Back to ready state
-    currentLEDState = COLOR_BLUE;
+    
+    if (lockUnlocked) {
+      setLEDColor(COLOR_GREEN); // Green if unlocked
+    } else {
+      setLEDColor(COLOR_BLUE); // Blue if locked
+    }
+    currentLEDState = lockUnlocked ? COLOR_GREEN : COLOR_BLUE;
     ledTimerActive = false; // Stop any active LED timer
     flashState = false; // Reset flash state
+    
     if (removalMode) {
       Serial.println(F("Card removal timeout expired. System locked."));
     } else {
-      Serial.println(F("Access timeout expired. System locked."));
+      Serial.println(F("Access timeout expired."));
     }
     Serial.println(F("================================================="));
   }
@@ -175,7 +211,7 @@ void loop() {
   else if (accessGranted) {
     handleNewCardDuringAccess();
   }
-  // Normal access check - check if card is authorized (this should come before waitingForMaster)
+  // Normal access check - check if card is authorized (single scan toggles lock)
   else if (isCardStored(mfrc522.uid.uidByte)) {
     // Reset waiting flag since we found an authorized card
     waitingForMaster = false;
@@ -202,6 +238,34 @@ void loop() {
   mfrc522.PCD_StopCrypto1();
   
   delay(500); // Reduced delay to allow faster double-tap detection
+}
+
+// Magnetic Lock Control Functions
+void engageLock() {
+  digitalWrite(RELAY_PIN, HIGH); // Relay ON = Lock engaged
+  lockUnlocked = false;
+  setLEDColor(COLOR_BLUE); // Blue = locked/ready
+  currentLEDState = COLOR_BLUE;
+  ledTimerActive = false;
+  lockEngagedBeep();
+  Serial.println(F("MAGNETIC LOCK ENGAGED"));
+  Serial.println(F("================================================="));
+}
+
+void releaseLock() {
+  digitalWrite(RELAY_PIN, LOW); // Relay OFF = Lock released
+  lockUnlocked = true;
+  setLEDColor(COLOR_GREEN); // Green = unlocked
+  currentLEDState = COLOR_GREEN;
+  ledTimerActive = false;
+  lockReleasedBeep();
+  Serial.println(F("MAGNETIC LOCK RELEASED"));
+  Serial.println(F("Lock will remain unlocked until toggled by authorized card."));
+  Serial.println(F("================================================="));
+}
+
+void handleLockControl() {
+  // This function is no longer needed - lock toggles immediately in handleAuthorizedCard()
 }
 
 // FIXED handleMasterCard() function with extensive debugging
@@ -341,19 +405,24 @@ void handleNewCardDuringAccess() {
   Serial.println(F("================================================="));
 }
 
-void handleAccessAttempt() {
-  // This function is now split into handleAuthorizedCard() and handleUnknownCard()
-  // This function is kept for compatibility but shouldn't be called
-}
-
 void handleAuthorizedCard() {
-  setLEDColorWithTimer(COLOR_GREEN); // Green for access granted
   accessGrantedBeep(); // Success beep
-  Serial.println(F("ACCESS GRANTED - Welcome!"));
+  
+  // Toggle lock state immediately
+  if (lockUnlocked) {
+    // Lock is currently unlocked - engage it
+    engageLock();
+  } else {
+    // Lock is currently engaged - release it
+    releaseLock();
+  }
+  
+  Serial.println(F("AUTHORIZED CARD - Lock Toggled"));
   Serial.print(F("Authorized card: "));
   printHex(mfrc522.uid.uidByte, mfrc522.uid.size);
   Serial.println();
-  Serial.println(F("Card has permanent access."));
+  Serial.print(F("New lock status: "));
+  Serial.println(lockUnlocked ? F("UNLOCKED") : F("LOCKED"));
   Serial.println(F("================================================="));
 }
 
@@ -548,6 +617,22 @@ void cardRemovalModeBeep() {
   delay(150);
   tone(BUZZER_PIN, 400, 100);
   delay(150);
+}
+
+void lockEngagedBeep() {
+  // Two descending tones for lock engaged
+  tone(BUZZER_PIN, 1000, 150);
+  delay(200);
+  tone(BUZZER_PIN, 600, 150);
+  delay(200);
+}
+
+void lockReleasedBeep() {
+  // Two ascending tones for lock released
+  tone(BUZZER_PIN, 600, 150);
+  delay(200);
+  tone(BUZZER_PIN, 1000, 150);
+  delay(200);
 }
 
 // EEPROM Functions
